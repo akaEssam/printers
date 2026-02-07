@@ -1,0 +1,378 @@
+using System.Diagnostics;
+using System.Drawing.Printing;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Windows.Forms;
+using CoreHtmlToImage;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Win32;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.PixelFormats;
+using Windows.UI.Notifications;
+using Windows.UI.Notifications.Management;
+using SharpImage = SixLabors.ImageSharp.Image;
+
+// ==========================================
+// 1. TOP-LEVEL STATEMENTS
+// ==========================================
+
+if (!StartupManager.IsRegistered())
+{
+    if (!IsAdministrator())
+    {
+        try
+        {
+            Process.Start(
+                new ProcessStartInfo
+                {
+                    FileName = Process.GetCurrentProcess().MainModule.FileName,
+                    UseShellExecute = true,
+                    Verb = "runas",
+                }
+            );
+            return;
+        }
+        catch (Exception)
+        {
+            MessageBox.Show(
+                "Administrator rights are required for the first run to set up Auto-Run."
+            );
+            return;
+        }
+    }
+    StartupManager.RegisterApp();
+}
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy(
+        "AllowLaravel",
+        p => p.SetIsOriginAllowed(_ => true).AllowAnyMethod().AllowAnyHeader()
+    );
+});
+
+var app = builder.Build();
+app.UseCors("AllowLaravel");
+
+app.Use(
+    async (context, next) =>
+    {
+        context.Response.Headers.Append("Access-Control-Allow-Private-Network", "true");
+        if (context.Request.Method == "OPTIONS")
+        {
+            context.Response.StatusCode = 200;
+            await context.Response.CompleteAsync();
+            return;
+        }
+        await next();
+    }
+);
+
+// --- API ENDPOINTS ---
+app.MapGet(
+    "/printers",
+    () =>
+    {
+        var printers = PrinterSettings.InstalledPrinters.Cast<string>().ToList();
+        return Results.Ok(printers);
+    }
+);
+
+app.MapPost(
+    "/print",
+    async ([FromBody] HtmlPrintRequest req) =>
+    {
+        try
+        {
+            var converter = new HtmlConverter();
+            string thermalHtml = req.HtmlContent;
+            var bytes = converter.FromHtmlString(thermalHtml, 576);
+
+            if (bytes == null || bytes.Length == 0)
+                return Results.Problem("Conversion failed.");
+
+            using Image<Rgb24> image = SharpImage.Load<Rgb24>(bytes);
+            var escPos = PrinterLogic.ConvertToEscPos(image);
+
+            IntPtr pBytes = Marshal.AllocCoTaskMem(escPos.Length);
+            Marshal.Copy(escPos, 0, pBytes, escPos.Length);
+            RawPrinterHelper.SendToSpooler(req.PrinterName, pBytes, escPos.Length);
+            Marshal.FreeCoTaskMem(pBytes);
+
+            return Results.Ok(new { success = true });
+        }
+        catch (Exception ex)
+        {
+            return Results.Problem(ex.Message);
+        }
+    }
+);
+
+NotificationMonitor.Start();
+
+Task.Run(() => app.Run("http://localhost:5000"));
+
+Application.SetHighDpiMode(HighDpiMode.SystemAware);
+Application.EnableVisualStyles();
+Application.Run();
+
+static bool IsAdministrator()
+{
+    using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+    WindowsPrincipal principal = new WindowsPrincipal(identity);
+    return principal.IsInRole(WindowsBuiltInRole.Administrator);
+}
+
+// ==========================================
+// 2. TYPE AND CLASS DECLARATIONS
+// ==========================================
+
+public record HtmlPrintRequest(string PrinterName, string HtmlContent);
+
+public static class StartupManager
+{
+    private const string AppName = "Serventa";
+    private const string RunKey = @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+
+    public static bool IsRegistered()
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(RunKey, false);
+        return key?.GetValue(AppName) != null;
+    }
+
+    public static void RegisterApp()
+    {
+        try
+        {
+            string appPath = Process.GetCurrentProcess().MainModule.FileName;
+            using var key = Registry.CurrentUser.OpenSubKey(RunKey, true);
+            if (key != null)
+            {
+                key.SetValue(AppName, $"\"{appPath}\"");
+                Console.WriteLine("[SYSTEM] Registered for Startup.");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("Register Error: " + ex.Message);
+        }
+    }
+}
+
+public static class NotificationMonitor
+{
+    private static UserNotificationListener? _listener;
+    private static uint _lastNotificationId = 0;
+
+    public static async void Start()
+    {
+        _listener = UserNotificationListener.Current;
+        var status = await _listener.RequestAccessAsync();
+        if (status != UserNotificationListenerAccessStatus.Allowed)
+            return;
+
+        Task.Run(async () =>
+        {
+            while (true)
+            {
+                try
+                {
+                    await CheckNotifications();
+                }
+                catch { }
+                await Task.Delay(1000);
+            }
+        });
+    }
+
+    private static async Task CheckNotifications()
+    {
+        var notifications = await _listener!.GetNotificationsAsync(NotificationKinds.Toast);
+        foreach (var n in notifications)
+        {
+            if (n.Id == _lastNotificationId)
+                continue;
+            string appName = n.AppInfo.DisplayInfo.DisplayName;
+
+            if (appName.Contains("Phone Link") || appName.Contains("Your Phone"))
+            {
+                var binding = n.Notification.Visual.GetBinding(
+                    KnownNotificationBindings.ToastGeneric
+                );
+                if (binding != null)
+                {
+                    var texts = binding.GetTextElements();
+                    string title = texts.FirstOrDefault()?.Text ?? "";
+                    string body = texts.Skip(1).FirstOrDefault()?.Text ?? "";
+
+                    if (
+                        body.Contains("call", StringComparison.OrdinalIgnoreCase)
+                        || body.Contains("incoming", StringComparison.OrdinalIgnoreCase)
+                    )
+                    {
+                        _lastNotificationId = n.Id;
+                        string number = new string(
+                            title.Where(c => char.IsDigit(c) || c == '+').ToArray()
+                        );
+                        if (!string.IsNullOrEmpty(number))
+                            PopupEngine.Show(number);
+                    }
+                }
+            }
+        }
+    }
+}
+
+public static class PopupEngine
+{
+    public static void Show(string number)
+    {
+        Thread t = new Thread(() =>
+        {
+            try
+            {
+                using Form f = new Form
+                {
+                    Text = "INCOMING CALL",
+                    Size = new System.Drawing.Size(350, 200),
+                    TopMost = true,
+                    StartPosition = FormStartPosition.CenterScreen,
+                    FormBorderStyle = FormBorderStyle.FixedDialog,
+                };
+
+                // Fixed ambiguity by using System.Drawing explicitly
+                Label l = new Label
+                {
+                    Text = $"Incoming Call:\n{number}",
+                    Dock = DockStyle.Top,
+                    Height = 100,
+                    TextAlign = System.Drawing.ContentAlignment.MiddleCenter,
+                    Font = new System.Drawing.Font("Segoe UI", 14, System.Drawing.FontStyle.Bold),
+                };
+
+                Button b = new Button
+                {
+                    Text = "OPEN POS",
+                    Dock = DockStyle.Bottom,
+                    Height = 60,
+                    BackColor = System.Drawing.Color.DodgerBlue,
+                    ForeColor = System.Drawing.Color.White,
+                    FlatStyle = FlatStyle.Flat,
+                    Font = new System.Drawing.Font("Segoe UI", 10, System.Drawing.FontStyle.Bold),
+                };
+
+                b.Click += (s, e) =>
+                {
+                    string clean = new string(number.Where(char.IsDigit).ToArray());
+                    Process.Start(
+                        new ProcessStartInfo($"https://serventa.cloud/pos?customer_number={clean}")
+                        {
+                            UseShellExecute = true,
+                        }
+                    );
+                    f.Close();
+                };
+
+                f.Controls.Add(l);
+                f.Controls.Add(b);
+                f.ShowDialog();
+            }
+            catch { }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+    }
+}
+
+public static class PrinterLogic
+{
+    public static byte[] ConvertToEscPos(Image<Rgb24> img)
+    {
+        List<byte> b = new();
+        int w = img.Width,
+            h = img.Height;
+        b.AddRange(
+            new byte[]
+            {
+                0x1D,
+                0x76,
+                0x30,
+                0x00,
+                (byte)((w / 8) % 256),
+                (byte)((w / 8) / 256),
+                (byte)(h % 256),
+                (byte)(h / 256),
+            }
+        );
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w / 8; x++)
+            {
+                byte slice = 0;
+                for (int bit = 0; bit < 8; bit++)
+                {
+                    if ((x * 8 + bit) < w && img[x * 8 + bit, y].R < 128)
+                        slice |= (byte)(0x80 >> bit);
+                }
+                b.Add(slice);
+            }
+        }
+        b.AddRange(new byte[] { 0x1B, 0x64, 0x03, 0x1B, 0x69 });
+        return b.ToArray();
+    }
+}
+
+public static class RawPrinterHelper
+{
+    [DllImport("winspool.Drv", EntryPoint = "OpenPrinterA", CharSet = CharSet.Ansi)]
+    public static extern bool OpenPrinter(string name, out IntPtr h, IntPtr pd);
+
+    [DllImport("winspool.Drv")]
+    public static extern bool ClosePrinter(IntPtr h);
+
+    [DllImport("winspool.Drv", EntryPoint = "StartDocPrinterA", CharSet = CharSet.Ansi)]
+    public static extern bool StartDocPrinter(
+        IntPtr h,
+        int level,
+        [In, MarshalAs(UnmanagedType.LPStruct)] DOCINFOA di
+    );
+
+    [DllImport("winspool.Drv")]
+    public static extern bool WritePrinter(IntPtr h, IntPtr p, int len, out int dw);
+
+    [DllImport("winspool.Drv")]
+    public static extern bool EndDocPrinter(IntPtr h);
+
+    [DllImport("winspool.Drv")]
+    public static extern bool StartPagePrinter(IntPtr h);
+
+    [DllImport("winspool.Drv")]
+    public static extern bool EndPagePrinter(IntPtr h);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public class DOCINFOA
+    {
+        public string pDocName = "Agent Print";
+        public string? pOutputFile;
+        public string pDataType = "RAW";
+    }
+
+    public static void SendToSpooler(string name, IntPtr p, int len)
+    {
+        if (OpenPrinter(name, out IntPtr h, IntPtr.Zero))
+        {
+            if (StartDocPrinter(h, 1, new DOCINFOA()))
+            {
+                if (StartPagePrinter(h))
+                {
+                    WritePrinter(h, p, len, out _);
+                    EndPagePrinter(h);
+                }
+                EndDocPrinter(h);
+            }
+            ClosePrinter(h);
+        }
+    }
+}
